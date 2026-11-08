@@ -182,39 +182,46 @@ class TransformerDetector(BaseDetector):
         :param answer: The original answer string.
         :param output_format: ``"tokens"`` or ``"spans"``.
         """
-        token_preds = torch.argmax(probabilities, dim=-1)
+
+        def as_list(values: torch.Tensor | list) -> list:
+            return values.tolist() if isinstance(values, torch.Tensor) else values
+
+        # Only answer-side rows are ever read, so skip the prompt rows up front.
+        answer_probs = probabilities[answer_start_token:]
+        token_preds = torch.argmax(answer_probs, dim=-1).tolist()
+        hallucination_probs = answer_probs[:, 1].tolist()
 
         if output_format == "tokens":
-            token_probs: list[dict] = []
-            for i in range(answer_start_token, input_ids.size(0)):
-                token_probs.append(
-                    {
-                        "token": self.tokenizer.decode([input_ids[i]]),
-                        "pred": token_preds[i].item(),
-                        "prob": probabilities[i, 1].item(),
-                    }
-                )
-            return token_probs
+            # One batched decode over single-id lists replaces one decode call per token.
+            tokens = self.tokenizer.batch_decode(
+                [[token_id] for token_id in as_list(input_ids)[answer_start_token:]]
+            )
+            return [
+                {"token": token, "pred": pred, "prob": prob}
+                for token, pred, prob in zip(tokens, token_preds, hallucination_probs)
+            ]
 
         # output_format == "spans"
-        if answer_start_token < offsets.size(0):
-            answer_char_offset = offsets[answer_start_token][0].item()
+        offsets = as_list(offsets)
+        if answer_start_token < len(offsets):
+            answer_char_offset = offsets[answer_start_token][0]
         else:
             answer_char_offset = 0
 
         spans: list[dict] = []
         current_span: dict | None = None
 
-        for i in range(answer_start_token, token_preds.size(0)):
-            token_start, token_end = offsets[i].tolist()
+        for (token_start, token_end), pred, prob in zip(
+            offsets[answer_start_token:], token_preds, hallucination_probs
+        ):
             if token_start == token_end:
                 continue
 
             rel_start = token_start - answer_char_offset
             rel_end = token_end - answer_char_offset
 
-            is_hallucination = token_preds[i].item() == 1
-            confidence = probabilities[i, 1].item() if is_hallucination else 0.0
+            is_hallucination = pred == 1
+            confidence = prob if is_hallucination else 0.0
 
             if is_hallucination:
                 if current_span is None:
@@ -290,31 +297,26 @@ class TransformerDetector(BaseDetector):
             truncation="only_first",
             max_length=self.max_length,
             padding=True,
-            return_offsets_mapping=True,
-            return_tensors="pt",
+            return_token_type_ids=False,
             add_special_tokens=True,
         )
-        offsets = batch.pop("offset_mapping")
-        seq_lens = batch["attention_mask"].sum(dim=1)
 
+        # Only the model inputs need tensors; ids and offsets are read from the fast
+        # encodings, which always carry offsets, so no offset mapping is requested.
         model_inputs = {
-            key: value.to(self.device)
-            for key, value in batch.items()
-            if key in ["input_ids", "attention_mask"]
+            key: torch.tensor(batch[key], device=self.device)
+            for key in ["input_ids", "attention_mask"]
         }
 
         with torch.no_grad():
             outputs = self.model(**model_inputs)
-        probabilities = torch.softmax(outputs.logits, dim=-1)
 
         results: list[list] = []
         for i, answer in enumerate(answers):
-            seq_len = int(seq_lens[i].item())
-            sequence_ids = batch.sequence_ids(i)
-            answer_start_token = next(
-                (idx for idx, seq_id in enumerate(sequence_ids) if seq_id == 1),
-                seq_len - 1,
-            )
+            encoding = batch.encodings[i]
+            seq_len = sum(encoding.attention_mask)
+            sequence_ids = encoding.sequence_ids
+            answer_start_token = sequence_ids.index(1) if 1 in sequence_ids else seq_len - 1
 
             if seq_len >= self.max_length:
                 logger.warning(
@@ -322,12 +324,14 @@ class TransformerDetector(BaseDetector):
                     f"max length ({self.max_length}) and may have been truncated."
                 )
 
+            # Pass only the answer-side rows; the prompt rows are never read.
+            answer_rows = slice(answer_start_token, seq_len)
             results.append(
                 self._decode_sample(
-                    batch["input_ids"][i, :seq_len],
-                    probabilities[i, :seq_len],
-                    offsets[i, :seq_len],
-                    answer_start_token,
+                    encoding.ids[answer_rows],
+                    torch.softmax(outputs.logits[i, answer_rows], dim=-1),
+                    encoding.offsets[answer_rows],
+                    0,
                     answer,
                     output_format,
                 )
