@@ -162,23 +162,28 @@ class HallucinationDataset(Dataset):
             truncation="only_first",
             max_length=max_length,
             return_offsets_mapping=True,
-            return_tensors="pt",
             add_special_tokens=True,
         )
 
-        offsets = encoding.pop("offset_mapping")[0]  # shape: (seq_length, 2)
+        offsets = torch.tensor(encoding.pop("offset_mapping"), dtype=torch.long)  # (seq_length, 2)
 
         # Compute answer_start_token from the answer side.  This is correct
         # even when the context has been truncated by truncation="only_first",
         # because the answer is never truncated in that mode.
         # Layout: [CLS] context_tokens [SEP] answer_tokens [SEP]
-        answer_only = tokenizer(answer, add_special_tokens=False, return_tensors="pt")
-        answer_token_count = answer_only["input_ids"].shape[1]
-        total_seq_len = encoding["input_ids"].shape[1]
+        sequence_ids = encoding.encodings[0].sequence_ids if encoding.is_fast else []
+        answer_token_count = sequence_ids.count(1)
+        if not answer_token_count or 0 not in sequence_ids:
+            # The pair encoding cannot tell (a side is empty or cut): tokenize the answer alone.
+            answer_token_count = len(tokenizer(answer, add_special_tokens=False)["input_ids"])
+        total_seq_len = len(encoding["input_ids"])
         answer_start_token = total_seq_len - answer_token_count - 1  # -1 for trailing [SEP]
 
+        for key, value in encoding.items():
+            encoding[key] = torch.tensor([value], dtype=torch.long)
+
         # Initialize labels: -100 for tokens before the asnwer, 0 for tokens in the answer.
-        labels = [-100] * encoding["input_ids"].shape[1]
+        labels = [-100] * total_seq_len
 
         return encoding, labels, offsets, answer_start_token
 
